@@ -9,14 +9,12 @@ docker run -e VISION-DETECTION=True -e API-KEY="mysecretkey" -v localstorage:/da
 ## Usage of this component
 The `deepstack_object` component adds an `image_processing` entity where the state of the entity is the total count of target objects that are above a `confidence` threshold which has a default value of 80%. You can have a single target object class, or multiple. The time of the last detection of any target object is in the `last target detection` attribute. The type and number of objects (of any confidence) is listed in the `summary` attributes. Optionally a region of interest (ROI) can be configured, and only objects with their center (represented by a `x`) within the ROI will be included in the state count. The ROI will be displayed as a green box, and objects with their center in the ROI have a red box.
 
-Also optionally the processed image can be saved to disk, with bounding boxes showing the location of detected objects. If `save_file_folder` is configured, an image with filename of format `deepstack_object_{source name}_latest.jpg` is over-written on each new detection of a target. Optionally this image can also be saved with a timestamp in the filename, if `save_timestamped_file` is configured as `True`. An event `deepstack.object_detected` is fired for each object detected that is in the targets list, and meets the confidence and ROI criteria. If you are a power user with advanced needs such as zoning detections or you want to track multiple object types, you will need to use the `deepstack.object_detected` events.
+Also optionally the processed image can be saved to disk, with bounding boxes showing the location of detected objects. If `file_out` list is configured, an images under specified paths will be saved. Paths can be valid HA templates. An event `deepstack.object_detected` is fired for each object detected that is in the targets list, and meets the confidence and ROI criteria. If you are a power user with advanced needs such as zoning detections or you want to track multiple object types, you will need to use the `deepstack.object_detected` events.
 
 **Note** that by default the component will **not** automatically scan images, but requires you to call the `image_processing.scan` service e.g. using an automation triggered by motion.
 
 ## Home Assistant setup
 Place the `custom_components` folder in your configuration directory (or add its contents to an existing `custom_components` folder). Then configure object detection. **Important:** It is necessary to configure only a single camera per `deepstack_object` entity. If you want to process multiple cameras, you will therefore need multiple `deepstack_object` `image_processing` entities.
-
-The component can optionally save snapshots of the processed images. If you would like to use this option, you need to create a folder where the snapshots will be stored. The folder should be in the same folder where your `configuration.yaml` file is located. In the example below, we have named the folder `snapshots`.
 
 Add to your Home-Assistant config:
 
@@ -28,10 +26,10 @@ image_processing:
     api_key: mysecretkey
     # custom_model: mask
     # confidence: 80
-    save_file_folder: /config/snapshots/
-    save_file_format: png
-    save_timestamped_file: True
-    always_save_latest_file: True
+    file_out:
+      - "/config/www/latest.jpg"
+      - "/media/Deepstack/latest.jpg"
+      - "/media/Deepstack/{{ now().strftime('%Y-%m-%d/%H:%M:%S') }}.jpg"
     scale: 0.75
     # roi_x_min: 0.35
     roi_x_max: 0.8
@@ -55,10 +53,7 @@ Configuration variables:
 - **timeout**: (Optional, default 10 seconds) The timeout for requests to deepstack.
 - **custom_model**: (Optional) The name of a custom model if you are using one. Don't forget to add the targets from the custom model below
 - **confidence**: (Optional) The confidence (in %) above which detected targets are counted in the sensor state. Default value: 80
-- **save_file_folder**: (Optional) The folder to save processed images to. Note that folder path should be added to [whitelist_external_dirs](https://www.home-assistant.io/docs/configuration/basic/)
-- **save_file_format**: (Optional, default `jpg`, alternatively `png`) The file format to save images as. `png` generally results in easier to read annotations.
-- **save_timestamped_file**: (Optional, default `False`, requires `save_file_folder` to be configured) Save the processed image with the time of detection in the filename.
-- **always_save_latest_file**: (Optional, default `False`, requires `save_file_folder` to be configured) Always save the last processed image, even if there were no detections.
+- **file_out**: (Optional) A list of templates for the integration to save processed images including bounding boxes. camera_entity is available as the entity_id string of the triggered source camera.
 - **scale**: (optional, default 1.0), range 0.1-1.0, applies a scaling factor to the images that are saved. This reduces the disk space used by saved images, and is especially beneficial when using high resolution cameras.
 - **show_boxes**: (optional, default `True`), if `False` bounding boxes are not shown on saved images
 - **roi_x_min**: (optional, default 0), range 0-1, must be less than roi_x_max
@@ -92,7 +87,7 @@ An example use case for event is to get an alert when some rarely appearing obje
 - `confidence` : the confidence in detection in the range 0 - 100%
 - `box` : the bounding box of the object
 - `centroid` : the centre point of the object
-- `saved_file` : the path to the saved annotated image, which is the timestamped file if `save_timestamped_file` is True, or the default saved image if False
+- `process_time` : time deepstack processing took
 
 An example automation using the `deepstack.object_detected` event is given below:
 
@@ -100,7 +95,6 @@ An example automation using the `deepstack.object_detected` event is given below
 - action:
     - data_template:
         caption: "New person detection with confidence {{ trigger.event.data.confidence }}"
-        file: "{{ trigger.event.data.saved_file  }}"
       service: telegram_bot.send_photo
   alias: Object detection automation
   condition: []
@@ -112,15 +106,6 @@ An example automation using the `deepstack.object_detected` event is given below
         name: person
 ```
 
-## Displaying the deepstack latest jpg file
-It easy to display the `deepstack_object_{source name}_latest.jpg` image with a [local_file](https://www.home-assistant.io/components/local_file/) camera. An example configuration is:
-```yaml
-camera:
-  - platform: local_file
-    file_path: /config/snapshots/deepstack_object_local_file_latest.jpg
-    name: deepstack_latest_person
-```
-
 ## Info on box
 The `box` coordinates and the box center (`centroid`) can be used to determine whether an object falls within a defined region-of-interest (ROI). This can be useful to include/exclude objects by their location in the image.
 
@@ -128,19 +113,7 @@ The `box` coordinates and the box center (`centroid`) can be used to determine w
 * The centroid is in `(x,y)` coordinates where `(0,0)` is the top left hand corner of the image and `(1,1)` is the bottom right corner of the image.
 
 ## Browsing saved images in HA
-I highly recommend using the Home Assistant Media Player Browser to browse and preview processed images. Add to your config something like:
-```yaml
-homeassistant:
-.
-.
-  whitelist_external_dirs:
-    - /config/images/
-  media_dirs:
-    local: /config/images/
-
-media_source:
-```
-And configure Deepstack to use the above directory for `save_file_folder`, then saved images can be browsed from the HA front end like below:
+I highly recommend using the Home Assistant Media Player Browser to browse and preview processed images.
 
 <p align="center">
 <img src="https://github.com/robmarkcole/HASS-Deepstack-object/blob/master/docs/media_player.png" width="750">

@@ -5,6 +5,7 @@ For more details about this platform, please refer to the documentation at
 https://home-assistant.io/components/image_processing.deepstack_object
 """
 from collections import namedtuple, Counter
+import time
 import datetime
 import io
 import logging
@@ -17,6 +18,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 import deepstack.core as ds
+from homeassistant.helpers import template
 import homeassistant.helpers.config_validation as cv
 import homeassistant.util.dt as dt_util
 import voluptuous as vol
@@ -66,10 +68,7 @@ CONF_API_KEY = "api_key"
 CONF_TARGET = "target"
 CONF_TARGETS = "targets"
 CONF_TIMEOUT = "timeout"
-CONF_SAVE_FILE_FORMAT = "save_file_format"
-CONF_SAVE_FILE_FOLDER = "save_file_folder"
-CONF_SAVE_TIMESTAMPTED_FILE = "save_timestamped_file"
-CONF_ALWAYS_SAVE_LATEST_FILE = "always_save_latest_file"
+CONF_FILE_OUT = "file_out"
 CONF_SHOW_BOXES = "show_boxes"
 CONF_ROI_Y_MIN = "roi_y_min"
 CONF_ROI_X_MIN = "roi_x_min"
@@ -99,7 +98,6 @@ EVENT_OBJECT_DETECTED = "deepstack.object_detected"
 BOX = "box"
 FILE = "file"
 OBJECT = "object"
-SAVED_FILE = "saved_file"
 MIN_CONFIDENCE = 0.1
 JPG = "jpg"
 PNG = "png"
@@ -134,10 +132,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_SCALE, default=DEAULT_SCALE): vol.All(
             vol.Coerce(float, vol.Range(min=0.1, max=1))
         ),
-        vol.Optional(CONF_SAVE_FILE_FOLDER): cv.isdir,
-        vol.Optional(CONF_SAVE_FILE_FORMAT, default=JPG): vol.In([JPG, PNG]),
-        vol.Optional(CONF_SAVE_TIMESTAMPTED_FILE, default=False): cv.boolean,
-        vol.Optional(CONF_ALWAYS_SAVE_LATEST_FILE, default=False): cv.boolean,
+        vol.Optional(CONF_FILE_OUT, default=[]): vol.All(cv.ensure_list, [cv.template]),
         vol.Optional(CONF_SHOW_BOXES, default=True): cv.boolean,
         vol.Optional(CONF_CROP_ROI, default=False): cv.boolean,
     }
@@ -159,10 +154,6 @@ def object_in_roi(roi: dict, centroid: dict) -> bool:
     target_center_point = Point(centroid["y"], centroid["x"])
     roi_box = Box(roi["y_min"], roi["x_min"], roi["y_max"], roi["x_max"])
     return point_in_box(roi_box, target_center_point)
-
-
-def get_valid_filename(name: str) -> str:
-    return re.sub(r"(?u)[^-\w.]", "", str(name).strip().replace(" ", "_"))
 
 
 def get_object_type(object_name: str) -> str:
@@ -215,13 +206,10 @@ def get_objects(predictions: list, img_width: int, img_height: int) -> List[Dict
 
 def setup_platform(hass, config, add_devices, discovery_info=None):
     """Set up the classifier."""
-    save_file_folder = config.get(CONF_SAVE_FILE_FOLDER)
-    if save_file_folder:
-        save_file_folder = Path(save_file_folder)
-
     entities = []
     for camera in config[CONF_SOURCE]:
         object_entity = ObjectClassifyEntity(
+            hass=hass,
             ip_address=config.get(CONF_IP_ADDRESS),
             port=config.get(CONF_PORT),
             api_key=config.get(CONF_API_KEY),
@@ -235,10 +223,7 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
             roi_x_max=config[CONF_ROI_X_MAX],
             scale=config[CONF_SCALE],
             show_boxes=config[CONF_SHOW_BOXES],
-            save_file_folder=save_file_folder,
-            save_file_format=config[CONF_SAVE_FILE_FORMAT],
-            save_timestamped_file=config.get(CONF_SAVE_TIMESTAMPTED_FILE),
-            always_save_latest_file=config.get(CONF_ALWAYS_SAVE_LATEST_FILE),
+            file_out=config[CONF_FILE_OUT],
             crop_roi=config[CONF_CROP_ROI],
             camera_entity=camera.get(CONF_ENTITY_ID),
             name=camera.get(CONF_NAME),
@@ -252,6 +237,7 @@ class ObjectClassifyEntity(ImageProcessingEntity):
 
     def __init__(
         self,
+        hass,
         ip_address,
         port,
         api_key,
@@ -265,10 +251,7 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         roi_x_max,
         scale,
         show_boxes,
-        save_file_folder,
-        save_file_format,
-        save_timestamped_file,
-        always_save_latest_file,
+        file_out,
         crop_roi,
         camera_entity,
         name=None,
@@ -316,12 +299,11 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         self._show_boxes = show_boxes
         self._image_width = None
         self._image_height = None
-        self._save_file_folder = save_file_folder
-        self._save_file_format = save_file_format
-        self._always_save_latest_file = always_save_latest_file
-        self._save_timestamped_file = save_timestamped_file
-        self._always_save_latest_file = always_save_latest_file
+        self._file_out = file_out
         self._image = None
+        self._process_time = 0
+
+        template.attach(hass, self._file_out)
 
     def process_image(self, image):
         """Process an image."""
@@ -360,16 +342,21 @@ class ObjectClassifyEntity(ImageProcessingEntity):
             )
 
         self._state = None
+        self._process_time = 0
         self._objects = []  # The parsed raw data
         self._targets_found = []
         self._summary = {}
-        saved_image_path = None
+        saved_image_paths = None
+
+        start = time.monotonic()
 
         try:
             predictions = self._dsobject.detect(image)
         except ds.DeepstackException as exc:
             _LOGGER.error("Deepstack error : %s", exc)
             return
+
+        self._process_time = time.monotonic() - start
 
         self._objects = get_objects(predictions, self._image_width, self._image_height)
         self._targets_found = []
@@ -403,19 +390,17 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         ]  # Just the list of target names, e.g. [car, car, person]
         self._summary = dict(Counter(targets_found))  # e.g. {'car':2, 'person':1}
 
-        if self._save_file_folder:
-            if self._state > 0 or self._always_save_latest_file:
-                saved_image_path = self.save_image(
+        if self._file_out:
+            if self._state > 0:
+                saved_image_paths = self.save_image(
                     self._targets_found,
-                    self._save_file_folder,
                 )
 
         # Fire events
         for target in self._targets_found:
             target_event_data = target.copy()
+            target_event_data["process_time"] = self._process_time
             target_event_data[ATTR_ENTITY_ID] = self.entity_id
-            if saved_image_path:
-                target_event_data[SAVED_FILE] = saved_image_path
             self.hass.bus.fire(EVENT_OBJECT_DETECTED, target_event_data)
 
     @property
@@ -459,17 +444,13 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         attr["all_objects"] = [
             {obj["name"]: obj["confidence"]} for obj in self._objects
         ]
-        if self._save_file_folder:
-            attr[CONF_SAVE_FILE_FOLDER] = str(self._save_file_folder)
-            attr[CONF_SAVE_FILE_FORMAT] = self._save_file_format
-            attr[CONF_SAVE_TIMESTAMPTED_FILE] = self._save_timestamped_file
-            attr[CONF_ALWAYS_SAVE_LATEST_FILE] = self._always_save_latest_file
+        attr["process_time"] = self._process_time
         return attr
 
-    def save_image(self, targets, directory) -> str:
+    def save_image(self, targets):
         """Draws the actual bounding box of the detected objects.
 
-        Returns: saved_image_path, which is the path to the saved timestamped file if configured, else the default saved image.
+        Returns: saved_image_paths, which is the list of paths to the saved files.
         """
         try:
             img = self._image.convert("RGB")
@@ -514,21 +495,18 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                 fill=RED,
             )
 
-        # Save images, returning the path of saved image as str
-        latest_save_path = (
-            directory
-            / f"{get_valid_filename(self._name).lower()}_latest.{self._save_file_format}"
-        )
-        img.save(latest_save_path)
-        _LOGGER.info("Deepstack saved file %s", latest_save_path)
-        saved_image_path = latest_save_path
+        # Save images, returning the paths of saved images
+        paths = []
+        for path_template in self._file_out:
+            if isinstance(path_template, template.Template):
+                paths.append(path_template.render(camera_entity=self._camera))
+            else:
+                paths.append(path_template)
 
-        if self._save_timestamped_file:
-            timestamp_save_path = (
-                directory
-                / f"{self._name}_{self._last_detection}.{self._save_file_format}"
-            )
-            img.save(timestamp_save_path)
-            _LOGGER.info("Deepstack saved file %s", timestamp_save_path)
-            saved_image_path = timestamp_save_path
-        return str(saved_image_path)
+        for path in paths:
+            _LOGGER.info("Deepstack saving results image to %s", path)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            img.save(path)
+
+        return paths
+
